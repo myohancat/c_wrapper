@@ -55,11 +55,10 @@ public:
 
     static void getCurrentTime(RealTime& time)
     {
-        struct timeval tv {};
-        gettimeofday(&tv, nullptr);
+        struct timespec now {};
+        clock_gettime(CLOCK_REALTIME, &now);
 
-        time_t current = tv.tv_sec;
-
+        time_t current = now.tv_sec;
         struct tm result {};
         localtime_r(&current, &result);
 
@@ -69,6 +68,6 @@ public:
         time.mHour  = result.tm_hour;
         time.mMin   = result.tm_min;
         time.mSec   = result.tm_sec;
-        time.mMsec  = tv.tv_usec / 1000;
+        time.mMsec = now.tv_nsec / 1000000;
     }
 };

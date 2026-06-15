@@ -21,6 +21,7 @@ WorkerThread::WorkerThread(const char* name, int priority, int cpuid)
       mCpuId(cpuid),
       mId{},
       mState(ThreadState::Idle),
+      mIsRunEntered(false),
       mWakeupRequested(false)
 {
     snprintf(mName, sizeof(mName), "%s", name);
@@ -130,6 +131,11 @@ bool WorkerThread::start(IWorker& worker)
     }
 
     {
+        Lock<Mutex> lock(mStartLock);
+        mIsRunEntered = false;
+    }
+
+    {
         Lock<Mutex> lock(mLock);
         mWorker = &worker;
         mState.store(ThreadState::Running);
@@ -148,6 +154,13 @@ bool WorkerThread::start(IWorker& worker)
         return false;
     }
 
+    {
+        Lock<Mutex> lock(mStartLock);
+        mCvStart.wait(mStartLock, [this]() {
+                return mIsRunEntered;
+        });
+    }
+
     if (mCpuId != -1)
     {
         cpu_set_t cpuset;
@@ -164,7 +177,6 @@ bool WorkerThread::start(IWorker& worker)
     char nameBuf[16];
     strncpy(nameBuf, mName, sizeof(nameBuf) - 1);
     nameBuf[sizeof(nameBuf) - 1] = '\0';
-
     ret = pthread_setname_np(mId, nameBuf);
     if (ret != 0)
     {
@@ -301,11 +313,15 @@ void* WorkerThread::_task_proc_priv(void* param) noexcept
         worker = pThis->mWorker;
     }
 
+    {
+        Lock<Mutex> lock(pThis->mStartLock);
+        pThis->mIsRunEntered = true;
+    }
+    pThis->mCvStart.broadcast();
+
     if (worker != nullptr)
     {
-        worker->onPostStart();
         worker->run();
-        worker->onPostStop();
     }
 
     ThreadState state = pThis->mState.load();
@@ -314,6 +330,11 @@ void* WorkerThread::_task_proc_priv(void* param) noexcept
         state == ThreadState::Stopping)
     {
         pThis->mState.store(ThreadState::Exited);
+    }
+
+    if (worker != nullptr)
+    {
+        worker->onPostStop();
     }
 
     return nullptr;

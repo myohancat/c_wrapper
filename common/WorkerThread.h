@@ -59,7 +59,7 @@ public:
      * Callback thread context:
      *
      * onPreStart()  : called by the thread that calls start(), before pthread_create().
-     * onPostStart() : called by the worker thread, before run().
+     * onPostStart() : called by the thread that calls start(), after pthread_crate().
      * onPreStop()   : called by the thread that requests stop().
      * onPostStop()  : called by the worker thread, after run().
      */
@@ -142,6 +142,10 @@ private:
     Mutex mLifecycleLock;
     Mutex mLock;
     std::atomic<ThreadState> mState;
+
+    bool mIsRunEntered;
+    Mutex mStartLock;
+    CondVar mCvStart;
 
     bool mWakeupRequested;
     mutable Mutex mSleepLock;
