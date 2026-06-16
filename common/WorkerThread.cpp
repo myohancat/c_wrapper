@@ -352,12 +352,14 @@ void* WorkerThread::taskEntry(void* param) noexcept
 {
     WorkerThread* self = static_cast<WorkerThread*>(param);
 
-    const int nameResult = pthread_setname_np(pthread_self(), self->mName);
-    if (nameResult != 0)
     {
-        LOGW("[%s] pthread_setname_np() failed: %s",
-             self->mName,
-             strerror(nameResult));
+        char nameBuf[16];
+        strncpy(nameBuf, self->mName, sizeof(nameBuf) - 1);
+        nameBuf[sizeof(nameBuf) - 1] = '\0';
+
+        const int nameResult = pthread_setname_np(pthread_self(), self->mName);
+        if (nameResult != 0)
+            LOGW("[%s] pthread_setname_np() failed: %s", self->mName, strerror(nameResult));
     }
 
     IWorker* worker = nullptr;

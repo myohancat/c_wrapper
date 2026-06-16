@@ -124,7 +124,7 @@ private:
     IWorker* mWorker;
 
     int mPriority;
-    char mName[16]; // Linux pthread name limit includes the terminating NUL.
+    char mName[32];
     pthread_t mId;
 
     // Serializes start()/stop()/join() and onCleanup().
