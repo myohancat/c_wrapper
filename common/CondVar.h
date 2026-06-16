@@ -10,7 +10,9 @@
 
 #include "Mutex.h"
 #include "SysTime.h"
+#include "Log.h"
 
+#include <string.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -23,10 +25,17 @@ public:
     {
         pthread_condattr_t attr;
 
-        pthread_condattr_init(&attr);
-        pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-        pthread_cond_init(&mId, &attr);
-        pthread_condattr_destroy(&attr);
+        int rc = pthread_condattr_init(&attr);
+        ABORT_IF(rc != 0);
+
+        rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+        ABORT_IF(rc != 0);
+
+        rc = pthread_cond_init(&mId, &attr);
+        ABORT_IF(rc != 0);
+
+        rc = pthread_condattr_destroy(&attr);
+        ABORT_IF(rc != 0);
     }
 
     ~CondVar()
@@ -39,7 +48,8 @@ public:
 
     void wait(Mutex& mutex)
     {
-        pthread_cond_wait(&mId, &mutex.mId);
+        int rc = pthread_cond_wait(&mId, &mutex.mId);
+        ABORT_IF(rc != 0);
     }
 
     bool wait(Mutex& mutex, int timeoutMs)
@@ -67,6 +77,12 @@ public:
     template <typename Predicate>
     bool wait(Mutex& mutex, int timeoutMs, Predicate pred)
     {
+        if (timeoutMs < 0)
+        {
+            wait(mutex, pred);
+            return true;
+        }
+
         uint64_t expireTime = SysTime::getTickCountMs() + static_cast<uint64_t>(timeoutMs);
 
         while (!pred())
@@ -81,12 +97,14 @@ public:
 
     void signal()
     {
-        pthread_cond_signal(&mId);
+        int rc = pthread_cond_signal(&mId);
+        ABORT_IF(rc != 0);
     }
 
     void broadcast()
     {
-        pthread_cond_broadcast(&mId);
+        int rc = pthread_cond_broadcast(&mId);
+        ABORT_IF(rc != 0);
     }
 
 private:
@@ -100,6 +118,9 @@ private:
 
         if (rc == 0) return true;
         if (rc == ETIMEDOUT) return false;
+
+        LOGE("pthread_cond_timedwait failed: rc=%d, error=%s", rc, strerror(rc));
+        ABORT_IF(rc != 0);
 
         return false;
     }

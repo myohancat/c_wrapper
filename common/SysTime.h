@@ -8,9 +8,10 @@
  */
 #pragma once
 
+#include "Log.h"
+
 #include <stdint.h>
 #include <time.h>
-#include <sys/time.h>
 
 struct RealTime
 {
@@ -29,34 +30,35 @@ public:
     static uint64_t getTickCountMs()
     {
         struct timespec now {};
-        clock_gettime(CLOCK_MONOTONIC, &now);
+        int rc = clock_gettime(CLOCK_MONOTONIC, &now);
+        ABORT_IF(rc != 0);
 
-        return static_cast<uint64_t>(now.tv_sec) * 1000
-             + now.tv_nsec / 1000000;
+        return static_cast<uint64_t>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
     }
 
     static uint64_t getTickCountUs()
     {
         struct timespec now {};
-        clock_gettime(CLOCK_MONOTONIC, &now);
+        int rc = clock_gettime(CLOCK_MONOTONIC, &now);
+        ABORT_IF(rc != 0);
 
-        return static_cast<uint64_t>(now.tv_sec) * 1000000
-             + now.tv_nsec / 1000;
+        return static_cast<uint64_t>(now.tv_sec) * 1000000 + now.tv_nsec / 1000;
     }
 
     static uint64_t getCurrentTime()
     {
-        struct timeval tv {};
-        gettimeofday(&tv, nullptr);
+        struct timespec now {};
+        int rc = clock_gettime(CLOCK_REALTIME, &now);
+        ABORT_IF(rc != 0);
 
-        return static_cast<uint64_t>(tv.tv_sec) * 1000
-             + tv.tv_usec / 1000;
+        return static_cast<uint64_t>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
     }
 
     static void getCurrentTime(RealTime& time)
     {
         struct timespec now {};
-        clock_gettime(CLOCK_REALTIME, &now);
+        int rc = clock_gettime(CLOCK_REALTIME, &now);
+        ABORT_IF(rc != 0);
 
         time_t current = now.tv_sec;
         struct tm result {};
