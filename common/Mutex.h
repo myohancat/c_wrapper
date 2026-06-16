@@ -8,6 +8,7 @@
  */
 #pragma once
 
+#include "Log.h"
 #include <pthread.h>
 
 /**
@@ -34,7 +35,12 @@ class Mutex
 friend class CondVar;
 
 public:
-    Mutex() { pthread_mutex_init(&mId, nullptr); }
+    Mutex()
+    {
+        int rc = pthread_mutex_init(&mId, nullptr);
+        ABORT_IF(rc == 0);
+    }
+
     ~Mutex() { pthread_mutex_destroy(&mId); }
 
     void lock() { pthread_mutex_lock(&mId); }
@@ -54,9 +60,16 @@ public:
     RecursiveMutex()
     {
         pthread_mutexattr_t attr;
-        pthread_mutexattr_init(&attr);
-        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-        pthread_mutex_init(&mId, &attr);
+
+        int ret = pthread_mutexattr_init(&attr);
+        ABORT_IF(ret != 0);
+
+        ret = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        ABORT_IF(ret != 0);
+
+        ret = pthread_mutex_init(&mId, &attr);
+        ABORT_IF(ret != 0);
+
         pthread_mutexattr_destroy(&attr);
     }
 
