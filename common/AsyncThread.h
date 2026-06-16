@@ -57,8 +57,8 @@ public:
     };
 
 public:
-    AsyncThread(const char* name = "AsyncThread", int priority = 0, int cpuid = -1)
-        : mThreadEngine(name, priority, cpuid)
+    AsyncThread(const char* name = "AsyncThread", int priority = 0)
+        : mThreadEngine(name, priority)
     {
     }
 
@@ -116,10 +116,9 @@ private:
     }
 
 private:
-    bool onPreStart() noexcept override { return true; }
-    void onPostStart() noexcept override {}
-    void onPreStop() noexcept override {}
-    void onPostStop() noexcept override {}
+    bool onPrepare() noexcept override { return true; }
+    void onStopRequested() noexcept override {}
+    void onCleanup() noexcept override {}
 
     AsyncThread(const AsyncThread&) = delete;
     AsyncThread& operator=(const AsyncThread&) = delete;

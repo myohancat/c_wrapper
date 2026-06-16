@@ -7,90 +7,96 @@
  * author: Kyungin Kim <myohancat@naver.com>
  */
 #include "WorkerThread.h"
-
 #include "Log.h"
 
-#include <unistd.h>
+#include <stdio.h>
+#include <time.h>
 #include <sched.h>
 #include <errno.h>
 #include <string.h>
 
-WorkerThread::WorkerThread(const char* name, int priority, int cpuid)
+WorkerThread::WorkerThread(const char* name, int priority)
     : mWorker(nullptr),
       mPriority(priority),
-      mCpuId(cpuid),
+      mName{},
       mId{},
       mState(ThreadState::Idle),
-      mIsRunEntered(false),
-      mWakeupRequested(false)
+      mStopRequested(false),
+      mThreadReady(false),
+      mStartReleased(false),
+      mWakeupRequested(false),
+      mCallbacksInProgress(0)
 {
-    snprintf(mName, sizeof(mName), "%s", name);
+    snprintf(mName, sizeof(mName), "%s", name != nullptr ? name : "Worker");
 }
 
 WorkerThread::~WorkerThread() noexcept
 {
-    ThreadState state = mState.load();
-
-    if (state == ThreadState::Idle)
-        return;
-
-    if (pthread_equal(pthread_self(), mId) != 0)
+    if (isCurrentThread())
     {
-        LOGE("[%s] WorkerThread destroyed from its own worker thread. State: %d", mName, static_cast<int>(state));
-        std::abort();
+        LOGE("[%s] WorkerThread destroyed from its own worker thread", mName);
+        ABORT_IF(true);
     }
 
     stop();
 }
 
-void WorkerThread::setCpuAffinity(int cpuid)
+void WorkerThread::resetStateLocked() noexcept
 {
-    Lock<Mutex> lifecycleLock(mLifecycleLock);
+    mWorker = nullptr;
+    mId = pthread_t{};
 
-    mCpuId = cpuid;
+    mStopRequested = false;
+    mThreadReady = false;
+    mStartReleased = false;
+    mWakeupRequested = false;
+    mCallbacksInProgress = 0;
 
-    if (cpuid == -1)
-        return;
-
-    ThreadState state = mState.load();
-
-    if (state != ThreadState::Running && state != ThreadState::Stopping)
-        return;
-
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpuid, &cpuset);
-
-    int ret = pthread_setaffinity_np(mId, sizeof(cpu_set_t), &cpuset);
-    if (ret != 0)
-    {
-        LOGW("[%s] Cannot pthread_setaffinity_np: %s", mName, strerror(ret));
-    }
+    mState.store(ThreadState::Idle, std::memory_order_release);
 }
 
 bool WorkerThread::start(IWorker& worker)
 {
     Lock<Mutex> lifecycleLock(mLifecycleLock);
 
-    ThreadState state = mState.load();
-
-    if (state == ThreadState::Exited)
-    {
+    if (mState.load(std::memory_order_acquire) == ThreadState::Exited)
         joinLocked();
-        state = mState.load();
+
+    {
+        Lock<Mutex> stateLock(mStateLock);
+
+        const ThreadState state = mState.load(std::memory_order_relaxed);
+        if (state != ThreadState::Idle)
+        {
+            LOGW("[%s] Worker is already active. State: %d", mName, static_cast<int>(state));
+            return false;
+        }
+
+        mWorker = &worker;
+        mId = pthread_t{};
+
+        mStopRequested = false;
+        mThreadReady = false;
+        mStartReleased = false;
+        mWakeupRequested = false;
+        mCallbacksInProgress = 0;
+
+        mState.store(ThreadState::Starting, std::memory_order_release);
     }
 
-    if (state != ThreadState::Idle)
-    {
-        LOGW("[%s] task is already running or stopping. State: %d", mName, static_cast<int>(state));
-        return false;
-    }
+    const auto resetToIdle = [this]() noexcept {
+        Lock<Mutex> stateLock(mStateLock);
+        resetStateLocked();
+        mStateCv.broadcast();
+        mSleepCv.broadcast();
+    };
 
     pthread_attr_t attr;
     int ret = pthread_attr_init(&attr);
     if (ret != 0)
     {
-        LOGW("[%s] Cannot pthread_attr_init: %s", mName, strerror(ret));
+        LOGE("[%s] pthread_attr_init() failed: %s", mName, strerror(ret));
+        resetToIdle();
         return false;
     }
 
@@ -98,89 +104,81 @@ bool WorkerThread::start(IWorker& worker)
     {
         ret = pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
         if (ret != 0)
-        {
-            LOGW("[%s] Cannot pthread_attr_setinheritsched: %s", mName, strerror(ret));
-        }
+            LOGW("[%s] pthread_attr_setinheritsched() failed: %s", mName, strerror(ret));
 
         ret = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
         if (ret != 0)
-        {
-            LOGW("[%s] Cannot pthread_attr_setschedpolicy: %s", mName, strerror(ret));
-        }
+            LOGW("[%s] pthread_attr_setschedpolicy() failed: %s", mName, strerror(ret));
 
-        sched_param params{};
-        params.sched_priority = mPriority;
+        sched_param param{};
+        param.sched_priority = mPriority;
 
-        ret = pthread_attr_setschedparam(&attr, &params);
+        ret = pthread_attr_setschedparam(&attr, &param);
         if (ret != 0)
-        {
-            LOGW("[%s] Cannot pthread_attr_setschedparam: %s", mName, strerror(ret));
-        }
+            LOGW("[%s] pthread_attr_setschedparam() failed: %s", mName, strerror(ret));
     }
 
-    if (!worker.onPreStart())
+    if (!worker.onPrepare())
     {
-        LOGE("[%s] onPreStart() failed", mName);
+        LOGE("[%s] onPrepare() failed", mName);
         pthread_attr_destroy(&attr);
+        resetToIdle();
         return false;
     }
 
-    {
-        Lock<Mutex> sleepLock(mSleepLock);
-        mWakeupRequested = false;
-    }
-
-    {
-        Lock<Mutex> lock(mStartLock);
-        mIsRunEntered = false;
-    }
-
-    {
-        Lock<Mutex> lock(mLock);
-        mWorker = &worker;
-        mState.store(ThreadState::Running);
-    }
-
-    ret = pthread_create(&mId, &attr, _task_proc_priv, this);
+    pthread_t createdId{};
+    ret = pthread_create(&createdId, &attr, &WorkerThread::taskEntry, this);
     pthread_attr_destroy(&attr);
 
     if (ret != 0)
     {
         LOGE("[%s] pthread_create() failed: %s", mName, strerror(ret));
-
-        Lock<Mutex> lock(mLock);
-        mWorker = nullptr;
-        mState.store(ThreadState::Idle);
+        resetToIdle();
+        worker.onCleanup();
         return false;
     }
 
+    IWorker* stopCallbackWorker = nullptr;
     {
-        Lock<Mutex> lock(mStartLock);
-        mCvStart.wait(mStartLock, [this]() {
-                return mIsRunEntered;
+        Lock<Mutex> stateLock(mStateLock);
+
+        mId = createdId;
+
+        mStateCv.wait(mStateLock, [this]() {
+            return mThreadReady;
         });
-    }
 
-    if (mCpuId != -1)
-    {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(mCpuId, &cpuset);
-
-        ret = pthread_setaffinity_np(mId, sizeof(cpu_set_t), &cpuset);
-        if (ret != 0)
+        if (mStopRequested)
         {
-            LOGW("[%s] Cannot pthread_setaffinity_np: %s", mName, strerror(ret));
+            mState.store(ThreadState::Stopping, std::memory_order_release);
+            stopCallbackWorker = mWorker;
+
+            if (stopCallbackWorker != nullptr)
+                ++mCallbacksInProgress;
+
+            mStartReleased = true;
+            mWakeupRequested = true;
+            mSleepCv.broadcast();
         }
+        else
+        {
+            mState.store(ThreadState::Running, std::memory_order_release);
+            mStartReleased = true;
+        }
+        mStateCv.broadcast();
     }
 
-    char nameBuf[16];
-    strncpy(nameBuf, mName, sizeof(nameBuf) - 1);
-    nameBuf[sizeof(nameBuf) - 1] = '\0';
-    ret = pthread_setname_np(mId, nameBuf);
-    if (ret != 0)
+    if (stopCallbackWorker != nullptr)
     {
-        LOGW("[%s] Cannot pthread_setname_np: %s", mName, strerror(ret));
+        stopCallbackWorker->onStopRequested();
+        {
+            Lock<Mutex> stateLock(mStateLock);
+
+            if (mCallbacksInProgress > 0)
+                --mCallbacksInProgress;
+
+            mStateCv.broadcast();
+        }
     }
 
     return true;
@@ -188,49 +186,57 @@ bool WorkerThread::start(IWorker& worker)
 
 void WorkerThread::requestStop() noexcept
 {
-    ThreadState state = mState.load();
+    IWorker* workerToNotify = nullptr;
 
-    if (state == ThreadState::Idle || state == ThreadState::Exited)
-        return;
-
-    ThreadState expected = ThreadState::Running;
-
-    if (mState.compare_exchange_strong(expected, ThreadState::Stopping))
     {
-        IWorker* worker = nullptr;
+        Lock<Mutex> stateLock(mStateLock);
 
+        const ThreadState state = mState.load(std::memory_order_relaxed);
+
+        if (state == ThreadState::Idle || state == ThreadState::Exited)
+            return;
+
+        mStopRequested = true;
+        mWakeupRequested = true;
+
+        if (state == ThreadState::Running)
         {
-            Lock<Mutex> lock(mLock);
-            worker = mWorker;
+            mState.store(ThreadState::Stopping, std::memory_order_release);
+            workerToNotify = mWorker;
+
+            if (workerToNotify != nullptr)
+                ++mCallbacksInProgress;
         }
 
-        if (worker != nullptr)
-        {
-            worker->onPreStop();
-        }
+        mStateCv.broadcast();
+        mSleepCv.broadcast();
     }
 
-    wakeup();
+    if (workerToNotify != nullptr)
+    {
+        workerToNotify->onStopRequested();
+        {
+            Lock<Mutex> stateLock(mStateLock);
+
+            if (mCallbacksInProgress > 0)
+                --mCallbacksInProgress;
+
+            mStateCv.broadcast();
+        }
+    }
 }
 
 void WorkerThread::join()
 {
-    ThreadState state = mState.load();
-
-    if (state == ThreadState::Idle)
-        return;
-
-    if (pthread_equal(pthread_self(), mId) != 0)
+    if (isCurrentThread())
     {
-        LOGE("[%s] WorkerThread::join() called from its own worker thread. State: %d", mName, static_cast<int>(state));
-        std::abort();
+        LOGE("[%s] join() called from its own worker thread", mName);
+        return;
     }
 
     Lock<Mutex> lifecycleLock(mLifecycleLock);
 
-    state = mState.load();
-
-    if (state == ThreadState::Idle)
+    if (mState.load(std::memory_order_acquire) == ThreadState::Idle)
         return;
 
     joinLocked();
@@ -238,23 +244,68 @@ void WorkerThread::join()
 
 void WorkerThread::stop()
 {
+    if (isCurrentThread())
+    {
+        requestStop();
+        return;
+    }
+
+    Lock<Mutex> lifecycleLock(mLifecycleLock);
+
     requestStop();
-    join();
+
+    if (mState.load(std::memory_order_acquire) != ThreadState::Idle)
+        joinLocked();
 }
 
 void WorkerThread::joinLocked()
 {
-    int ret = pthread_join(mId, nullptr);
+    pthread_t threadId{};
+
+    {
+        Lock<Mutex> stateLock(mStateLock);
+
+        const ThreadState state = mState.load(std::memory_order_relaxed);
+        if (state == ThreadState::Idle)
+            return;
+
+        if (state == ThreadState::Starting)
+        {
+            LOGE("[%s] joinLocked() observed an incomplete start", mName);
+            return;
+        }
+
+        threadId = mId;
+    }
+
+    const int ret = pthread_join(threadId, nullptr);
     if (ret != 0)
     {
         LOGE("[%s] pthread_join() failed: %s", mName, strerror(ret));
         return;
     }
 
+    IWorker* workerToCleanup = nullptr;
+
     {
-        Lock<Mutex> lock(mLock);
+        Lock<Mutex> stateLock(mStateLock);
+
+        mStateCv.wait(mStateLock, [this]() {
+            return mCallbacksInProgress == 0;
+        });
+
+        workerToCleanup = mWorker;
         mWorker = nullptr;
-        mState.store(ThreadState::Idle);
+    }
+
+    if (workerToCleanup != nullptr)
+        workerToCleanup->onCleanup();
+
+    {
+        Lock<Mutex> stateLock(mStateLock);
+        resetStateLocked();
+        mStateCv.broadcast();
+        mSleepCv.broadcast();
     }
 }
 
@@ -263,78 +314,76 @@ void WorkerThread::msleep(int msec)
     if (msec <= 0)
         return;
 
-    ThreadState state = mState.load();
-
-    if ((state == ThreadState::Running || state == ThreadState::Stopping) &&
-        pthread_equal(pthread_self(), mId) != 0)
     {
-        Lock<Mutex> lock(mSleepLock);
+        Lock<Mutex> stateLock(mStateLock);
 
-        if (mState.load() == ThreadState::Stopping)
+        const ThreadState state = mState.load(std::memory_order_relaxed);
+        const bool currentWorker =
+            (state == ThreadState::Running || state == ThreadState::Stopping) &&
+            pthread_equal(pthread_self(), mId) != 0;
+
+        if (currentWorker)
+        {
+            if (state == ThreadState::Stopping)
+                return;
+
+            mSleepCv.wait(mStateLock, msec, [this]() {
+                return mState.load(std::memory_order_relaxed) != ThreadState::Running ||
+                       mWakeupRequested;
+            });
+
+            mWakeupRequested = false;
             return;
-
-        mCvSleep.wait(mSleepLock, msec, [this]() {
-            return mState.load() == ThreadState::Stopping || mWakeupRequested;
-        });
-
-        mWakeupRequested = false;
-        return;
+        }
     }
 
-    timespec req;
-    req.tv_sec = msec / 1000;
-    req.tv_nsec = static_cast<long>(msec % 1000) * 1000000L;
+    timespec request{};
+    request.tv_sec = msec / 1000;
+    request.tv_nsec = static_cast<long>(msec % 1000) * 1000000L;
 
-    while (nanosleep(&req, &req) != 0)
+    while (nanosleep(&request, &request) != 0)
     {
         if (errno != EINTR)
             break;
     }
 }
 
-void WorkerThread::wakeup()
+void* WorkerThread::taskEntry(void* param) noexcept
 {
+    WorkerThread* self = static_cast<WorkerThread*>(param);
+
+    const int nameResult = pthread_setname_np(pthread_self(), self->mName);
+    if (nameResult != 0)
     {
-        Lock<Mutex> lock(mSleepLock);
-        mWakeupRequested = true;
+        LOGW("[%s] pthread_setname_np() failed: %s",
+             self->mName,
+             strerror(nameResult));
     }
-
-    mCvSleep.broadcast();
-}
-
-void* WorkerThread::_task_proc_priv(void* param) noexcept
-{
-    WorkerThread* pThis = static_cast<WorkerThread*>(param);
 
     IWorker* worker = nullptr;
 
     {
-        Lock<Mutex> lock(pThis->mLock);
-        worker = pThis->mWorker;
-    }
+        Lock<Mutex> stateLock(self->mStateLock);
 
-    {
-        Lock<Mutex> lock(pThis->mStartLock);
-        pThis->mIsRunEntered = true;
+        self->mThreadReady = true;
+        self->mStateCv.broadcast();
+
+        self->mStateCv.wait(self->mStateLock, [self]() {
+            return self->mStartReleased;
+        });
+
+        worker = self->mWorker;
     }
-    pThis->mCvStart.broadcast();
 
     if (worker != nullptr)
-    {
         worker->run();
-    }
 
-    ThreadState state = pThis->mState.load();
-
-    if (state == ThreadState::Running ||
-        state == ThreadState::Stopping)
     {
-        pThis->mState.store(ThreadState::Exited);
-    }
+        Lock<Mutex> stateLock(self->mStateLock);
 
-    if (worker != nullptr)
-    {
-        worker->onPostStop();
+        self->mState.store(ThreadState::Exited, std::memory_order_release);
+        self->mStateCv.broadcast();
+        self->mSleepCv.broadcast();
     }
 
     return nullptr;

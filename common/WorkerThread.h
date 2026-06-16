@@ -53,67 +53,50 @@ class IWorker
 public:
     virtual ~IWorker() noexcept = default;
 
+    /*
+     * Called by the worker thread.
+     */
     virtual void run() noexcept = 0;
 
-    /*
-     * Callback thread context:
-     *
-     * onPreStart()  : called by the thread that calls start(), before pthread_create().
-     * onPostStart() : called by the thread that calls start(), after pthread_crate().
-     * onPreStop()   : called by the thread that requests stop().
-     * onPostStop()  : called by the worker thread, after run().
-     */
-    virtual bool onPreStart() noexcept { return true; }
-    virtual void onPreStop() noexcept {}
 
-    virtual void onPostStart() noexcept {}
-    virtual void onPostStop() noexcept {}
+    /*
+     * Called by the start() caller before pthread_create().
+     * Note : Must not call start(), stop(), requestStop(), or join().
+     */
+    virtual bool onPrepare() noexcept { return true; }
+
+    /*
+     * Called once after the state changes to Stopping.
+     * Note : Must not call start(), stop(), requestStop(), or join().
+     */
+    virtual void onStopRequested() noexcept {}
+
+    /*
+     * Called after pthread_join() succeeds or pthread_create() fails after onPrepare() succeeds.
+     * Note : Must not call start(), stop(), requestStop(), or join().
+     */
+    virtual void onCleanup() noexcept {}
 };
+
 
 class WorkerThread
 {
 public:
-    WorkerThread(const char* name = "Worker",
-                 int priority = -1,
-                 int cpuid = -1);
+    explicit WorkerThread(const char* name = "Worker", int priority = -1);
 
     ~WorkerThread() noexcept;
 
     WorkerThread(const WorkerThread&) = delete;
     WorkerThread& operator=(const WorkerThread&) = delete;
 
-    void setCpuAffinity(int cpuid);
-    int getCpuAffinity() const;
-
     bool start(IWorker& worker);
+    void stop(); // requestStop() + join()
 
-    /*
-     * Requests the worker thread to stop.
-     *
-     * This does not join.
-     * It changes Running -> Stopping, calls onPreStop(), and wakes the worker.
-     * Safe to call from the worker thread itself.
-     */
     void requestStop() noexcept;
-
-    /*
-     * Waits for the worker thread to finish and joins it.
-     *
-     * This does not request stop.
-     * If the worker keeps running, this call blocks indefinitely.
-     * Must not be called from the worker thread itself.
-     */
     void join();
-
-    /*
-     * requestStop() + join()
-     */
-    void stop();
 
     void sleep(int sec);
     void msleep(int msec);
-
-    void wakeup();
 
     bool shouldRun() const noexcept;
     bool isCurrentThread() const noexcept;
@@ -122,40 +105,45 @@ private:
     enum class ThreadState : uint8_t
     {
         Idle,
+        Starting,
         Running,
         Stopping,
         Exited
     };
 
 private:
-    static void* _task_proc_priv(void* param) noexcept;
+    static void* taskEntry(void* param) noexcept;
 
+    // Caller must hold mLifecycleLock.
     void joinLocked();
+
+    // Caller must hold mStateLock.
+    void resetStateLocked() noexcept;
 
 private:
     IWorker* mWorker;
+
     int mPriority;
-    int mCpuId;
-    char mName[32];
+    char mName[16]; // Linux pthread name limit includes the terminating NUL.
     pthread_t mId;
 
+    // Serializes start()/stop()/join() and onCleanup().
     Mutex mLifecycleLock;
-    Mutex mLock;
+
+    // Protects mId, mWorker, all flags, and all state transitions.
+    mutable Mutex mStateLock;
+    CondVar mStateCv;
+    CondVar mSleepCv;
+
     std::atomic<ThreadState> mState;
 
-    bool mIsRunEntered;
-    Mutex mStartLock;
-    CondVar mCvStart;
-
+    bool mStopRequested;
+    bool mThreadReady;
+    bool mStartReleased;
     bool mWakeupRequested;
-    mutable Mutex mSleepLock;
-    CondVar mCvSleep;
-};
 
-inline int WorkerThread::getCpuAffinity() const
-{
-    return mCpuId;
-}
+    uint32_t mCallbacksInProgress;
+};
 
 inline void WorkerThread::sleep(int sec)
 {
@@ -170,13 +158,20 @@ inline void WorkerThread::sleep(int sec)
 
 inline bool WorkerThread::shouldRun() const noexcept
 {
-    return mState.load() == ThreadState::Running;
+    return mState.load(std::memory_order_acquire) == ThreadState::Running;
 }
 
 inline bool WorkerThread::isCurrentThread() const noexcept
 {
-    ThreadState state = mState.load();
+    Lock<Mutex> lock(mStateLock);
 
-    return (state == ThreadState::Running || state == ThreadState::Stopping) &&
-           pthread_equal(pthread_self(), mId) != 0;
+    const ThreadState state = mState.load(std::memory_order_relaxed);
+
+    if (state != ThreadState::Running &&
+        state != ThreadState::Stopping)
+    {
+        return false;
+    }
+
+    return pthread_equal(pthread_self(), mId) != 0;
 }
