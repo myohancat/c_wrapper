@@ -13,6 +13,9 @@
 #include <array>
 #include <utility>
 
+/**
+ * Primitive Circular Queue, But not thread-safe.
+ */
 template <typename T, size_t capacity>
 class CircularQueue
 {
